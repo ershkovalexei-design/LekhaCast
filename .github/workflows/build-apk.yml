@@ -11,6 +11,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
     steps:
       - name: Checkout branding repository
         uses: actions/checkout@v4
@@ -30,13 +32,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android build packages
         run: |
-          yes | sdkmanager --licenses
-          sdkmanager --install "platforms;android-37" "ndk;27.0.12077973" "cmake;3.22.1"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Android sdkmanager not found under $ANDROID_HOME/cmdline-tools"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" --install "platforms;android-37" "ndk;27.0.12077973" "cmake;3.22.1"
 
       - name: Apply Lekha Cast branding
         run: |
