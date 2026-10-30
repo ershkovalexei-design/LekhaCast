@@ -77,6 +77,18 @@ jobs:
           content = content.replace("type == 19 || type == 20 || type == 21 || type == 32 || type == 33", "type in 16..21")
           video.write_text(content, encoding="utf-8")
 
+          # Fail the build if upstream changes make the recovery patch stop applying.
+          patched = video.read_text(encoding="utf-8")
+          required = [
+              'dropping frame and waiting for keyframe',
+              'stopCodec()',
+              'type == 5',
+              'type in 16..21',
+          ]
+          missing = [item for item in required if item not in patched]
+          if missing:
+              raise SystemExit("Video recovery patch verification failed: " + ", ".join(missing))
+
           gradle = Path("airplay-src/app/build.gradle.kts")
           content = gradle.read_text(encoding="utf-8")
           if "compileSdk = 37" not in content or "targetSdk = 37" not in content:
