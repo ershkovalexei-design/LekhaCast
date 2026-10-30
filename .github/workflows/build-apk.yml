@@ -263,7 +263,7 @@ jobs:
                     )
                 }
         
-        '''
+          '''
           if anchor not in content: raise SystemExit("Could not locate decode section for video settings")
           content = content.replace(anchor, controls + anchor, 1)
           settings.write_text(content, encoding="utf-8")
