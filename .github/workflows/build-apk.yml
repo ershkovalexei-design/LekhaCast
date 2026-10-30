@@ -77,6 +77,209 @@ jobs:
           content = content.replace("type == 19 || type == 20 || type == 21 || type == 32 || type == 33", "type in 16..21")
           video.write_text(content, encoding="utf-8")
 
+          # Add a bounded, timestamp-paced video jitter buffer (video only).
+          video = Path("airplay-src/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt")
+          content = video.read_text(encoding="utf-8")
+          content = content.replace(
+              "import android.view.Surface\n",
+              "import android.view.Surface\nimport java.util.concurrent.ArrayBlockingQueue\nimport java.util.concurrent.TimeUnit\nimport java.util.concurrent.atomic.AtomicBoolean\n"
+          )
+          content = content.replace(
+              "    private val lock = Object()\n",
+              """    private val lock = Object()
+              private data class QueuedVideoFrame(val data: ByteArray, val ntpNs: Long, val h265: Boolean)
+              private val videoQueue = ArrayBlockingQueue<QueuedVideoFrame>(180)
+              private val bufferRunning = AtomicBoolean(true)
+              private val bufferWorker = Thread({ runVideoBuffer() }, "LekhaVideoBuffer").apply {
+                  isDaemon = true
+                  start()
+              }
+              private var bufferBaseNtpNs = Long.MIN_VALUE
+              private var bufferBaseReleaseNs = 0L
+              private var waitForBufferKeyframe = false
+              private val bufferPrefs by lazy {
+                  ctx.getSharedPreferences(io.github.jqssun.airplay.Prefs.NAME, Context.MODE_PRIVATE)
+              }
+              private fun videoBufferEnabled() = bufferPrefs.getBoolean("video_buffer_enabled", false)
+              private fun videoBufferMs() = bufferPrefs.getInt("video_buffer_ms", 3000).coerceIn(500, 10000)
+              private fun runVideoBuffer() {
+                  while (bufferRunning.get()) {
+                      try {
+                          val frame = videoQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                          if (!videoBufferEnabled()) {
+                              bufferBaseNtpNs = Long.MIN_VALUE
+                              processFrame(frame.data, frame.ntpNs, frame.h265)
+                              continue
+                          }
+                          if (bufferBaseNtpNs == Long.MIN_VALUE || frame.ntpNs < bufferBaseNtpNs ||
+                              frame.ntpNs - bufferBaseNtpNs > 10_000_000_000L) {
+                              bufferBaseNtpNs = frame.ntpNs
+                              bufferBaseReleaseNs = System.nanoTime() + videoBufferMs() * 1_000_000L
+                          }
+                          val dueNs = bufferBaseReleaseNs + (frame.ntpNs - bufferBaseNtpNs)
+                          while (bufferRunning.get()) {
+                              val waitNs = dueNs - System.nanoTime()
+                              if (waitNs <= 0) break
+                              TimeUnit.NANOSECONDS.sleep(minOf(waitNs, 20_000_000L))
+                          }
+                          if (bufferRunning.get()) processFrame(frame.data, frame.ntpNs, frame.h265)
+                      } catch (e: InterruptedException) {
+                          if (!bufferRunning.get()) break
+                      } catch (e: Exception) {
+                          Log.w(TAG, "Video buffer worker error", e)
+                      }
+                  }
+              }
+              """
+          )
+          old = """    fun feedFrame(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                  synchronized(lock) {
+                      _updateStats(data.size)
+                      if (videoWidth == 0 || videoHeight == 0) return
+
+                      if (codec == null || isH265 != currentH265) {
+                          // a stale reference frame decodes to corruption, so wait for a keyframe to (re)start
+                          if (!_isKeyframe(data, isH265)) {
+                              if (codec != null) stopCodec()
+                              return
+                          }
+                          stopCodec()
+                      }
+
+                      try {
+                          if (codec == null) startCodec(isH265)
+                          _feedToCodec(data, ntpTimeNs)
+                          drainOutput()
+                      } catch (e: Exception) {
+                          Log.w(TAG, "Codec error, resetting", e)
+                          stopCodec()
+                      }
+                  }
+              }
+          """
+          new = """    fun feedFrame(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                  _updateStats(data.size)
+                  if (videoWidth == 0 || videoHeight == 0 || !bufferRunning.get()) return
+                  if (!videoBufferEnabled()) {
+                      videoQueue.clear()
+                      bufferBaseNtpNs = Long.MIN_VALUE
+                      processFrame(data, ntpTimeNs, isH265)
+                      return
+                  }
+                  if (waitForBufferKeyframe) {
+                      if (!_isKeyframe(data, isH265)) { droppedFrames++; return }
+                      waitForBufferKeyframe = false
+                  }
+                  if (!videoQueue.offer(QueuedVideoFrame(data.copyOf(), ntpTimeNs, isH265))) {
+                      videoQueue.clear()
+                      bufferBaseNtpNs = Long.MIN_VALUE
+                      waitForBufferKeyframe = true
+                      droppedFrames++
+                      Log.w(TAG, "Video jitter buffer full; cleared queue and waiting for keyframe")
+                      if (_isKeyframe(data, isH265)) {
+                          waitForBufferKeyframe = false
+                          videoQueue.offer(QueuedVideoFrame(data.copyOf(), ntpTimeNs, isH265))
+                      }
+                  }
+              }
+
+              private fun processFrame(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                  synchronized(lock) {
+                      if (videoWidth == 0 || videoHeight == 0) return
+                      if (codec == null || isH265 != currentH265) {
+                          if (!_isKeyframe(data, isH265)) {
+                              if (codec != null) stopCodec()
+                              return
+                          }
+                          stopCodec()
+                      }
+                      try {
+                          if (codec == null) startCodec(isH265)
+                          _feedToCodec(data, ntpTimeNs)
+                          drainOutput()
+                      } catch (e: Exception) {
+                          Log.w(TAG, "Codec error, resetting", e)
+                          stopCodec()
+                      }
+                  }
+              }
+          """
+          if old not in content:
+              raise SystemExit("Could not locate VideoRenderer.feedFrame for buffer patch")
+          content = content.replace(old, new, 1)
+          content = content.replace(
+              "    fun stopSession() = synchronized(lock) { stopCodec() }",
+              "    fun stopSession() { videoQueue.clear(); bufferBaseNtpNs = Long.MIN_VALUE; synchronized(lock) { stopCodec() } }"
+          )
+          content = content.replace(
+              "    fun release() = synchronized(lock) {\n        stopCodec()",
+              "    fun release() {\n        bufferRunning.set(false); videoQueue.clear(); bufferWorker.interrupt()\n        synchronized(lock) { stopCodec()"
+          ).replace(
+              "        _resetStats()\n    }\n\n    private fun _recordOutputFrameTime()",
+              "        _resetStats()\n        }\n    }\n\n    private fun _recordOutputFrameTime()"
+          )
+          video.write_text(content, encoding="utf-8")
+
+          prefs = Path("airplay-src/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt")
+          content = prefs.read_text(encoding="utf-8")
+          anchor = '    val SCHEDULED_OUTPUT_BUFFER_RELEASE = bool("scheduled_output_buffer_release", false, restart = true)\n'
+          if anchor not in content: raise SystemExit("Could not locate video preference insertion point")
+          content = content.replace(anchor, anchor + '    val VIDEO_BUFFER_ENABLED = bool("video_buffer_enabled", false)\n    val VIDEO_BUFFER_MS = int("video_buffer_ms", 3000, 500..10000)\n')
+          prefs.write_text(content, encoding="utf-8")
+
+          settings = Path("airplay-src/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt")
+          content = settings.read_text(encoding="utf-8")
+          anchor = '    val scheduledOutputBufferRelease by viewModel.pref(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE).collectAsState()\n'
+          if anchor not in content: raise SystemExit("Could not locate video settings state insertion point")
+          content = content.replace(anchor, anchor + '    val videoBufferEnabled by viewModel.pref(Prefs.VIDEO_BUFFER_ENABLED).collectAsState()\n    val videoBufferMs by viewModel.pref(Prefs.VIDEO_BUFFER_MS).collectAsState()\n')
+          anchor = '        SectionHeader(stringResource(R.string.section_decode))\n'
+          controls = '''        SectionHeader("Видеобуфер")
+        
+                SettingSwitch(
+                    title = "Буферизация видео",
+                    description = "Сглаживает сетевые задержки. Добавляет задержку изображения; звук не изменяется.",
+                    checked = videoBufferEnabled,
+                    onCheckedChange = { viewModel.set(Prefs.VIDEO_BUFFER_ENABLED, it) }
+                )
+        
+                if (videoBufferEnabled) {
+                    var videoBufferValue by remember(videoBufferMs) { mutableFloatStateOf(videoBufferMs.toFloat()) }
+                    ListItem(
+                        headlineContent = { Text("Размер буфера") },
+                        supportingContent = {
+                            Slider(
+                                value = videoBufferValue,
+                                onValueChange = { videoBufferValue = it },
+                                onValueChangeFinished = { viewModel.set(Prefs.VIDEO_BUFFER_MS, videoBufferValue.roundToInt()) },
+                                valueRange = 500f..10000f,
+                                steps = 18,
+                                modifier = Modifier.dpadFocus().dpadAdjust(
+                                    onLeft = { viewModel.set(Prefs.VIDEO_BUFFER_MS, (videoBufferMs - 500).coerceIn(500, 10000)) },
+                                    onRight = { viewModel.set(Prefs.VIDEO_BUFFER_MS, (videoBufferMs + 500).coerceIn(500, 10000)) }
+                                )
+                            )
+                        },
+                        trailingContent = { Text("${videoBufferValue.roundToInt()} мс") }
+                    )
+                }
+        
+        '''
+          if anchor not in content: raise SystemExit("Could not locate decode section for video settings")
+          content = content.replace(anchor, controls + anchor, 1)
+          settings.write_text(content, encoding="utf-8")
+
+          # Verify the complete feature was applied, not merely that the workflow ran.
+          checks = [
+              ("VideoRenderer.kt", "ArrayBlockingQueue<QueuedVideoFrame>(180)"),
+              ("VideoRenderer.kt", "processFrame(data, ntpTimeNs, isH265)"),
+              ("Prefs.kt", 'VIDEO_BUFFER_ENABLED = bool("video_buffer_enabled", false)'),
+              ("SettingsScreen.kt", '"Размер буфера"'),
+          ]
+          for filename, needle in checks:
+              source = Path("airplay-src/app/src/main/kotlin/io/github/jqssun/airplay/" + ("renderer/" if filename == "VideoRenderer.kt" else "ui/" if filename == "SettingsScreen.kt" else "") + filename).read_text(encoding="utf-8")
+              if needle not in source:
+                  raise SystemExit("Video buffer feature verification failed: " + filename + " / " + needle)
+
           # Fail the build if upstream changes make the recovery patch stop applying.
           patched = video.read_text(encoding="utf-8")
           required = [
