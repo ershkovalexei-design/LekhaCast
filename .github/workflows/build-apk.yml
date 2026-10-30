@@ -70,6 +70,13 @@ jobs:
               raise SystemExit("Could not find expected VideoRenderer input-drop block")
           video.write_text(content.replace(old_drop, new_drop, 1), encoding="utf-8")
 
+          # SPS/PPS parameter sets are not random-access frames. Restart only
+          # on an actual AVC IDR or HEVC IRAP frame.
+          content = video.read_text(encoding="utf-8")
+          content = content.replace("type == 5 || type == 7", "type == 5")
+          content = content.replace("type == 19 || type == 20 || type == 21 || type == 32 || type == 33", "type == 19 || type == 20 || type == 21")
+          video.write_text(content, encoding="utf-8")
+
           gradle = Path("airplay-src/app/build.gradle.kts")
           content = gradle.read_text(encoding="utf-8")
           if "compileSdk = 37" not in content or "targetSdk = 37" not in content:
