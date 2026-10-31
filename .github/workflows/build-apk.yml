@@ -3,7 +3,7 @@ name: Build Lekha Cast APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, youtube-airplay-videobridge]
 
 permissions:
   contents: read
@@ -46,6 +46,31 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
+          # Give AirPlay Video a larger ExoPlayer read-ahead buffer. This affects
+          # native AirPlay video playback only; screen mirroring is unchanged.
+          player = Path("airplay-src/app/src/main/kotlin/io/github/jqssun/airplay/renderer/AirPlayVideoPlayer.kt")
+          content = player.read_text(encoding="utf-8")
+          import_anchor = "import androidx.media3.exoplayer.ExoPlayer\\n"
+          if import_anchor not in content:
+              raise SystemExit("Could not find ExoPlayer import for video buffering patch")
+          content = content.replace(import_anchor, import_anchor + "import androidx.media3.exoplayer.DefaultLoadControl\\n", 1)
+          builder_anchor = "val p = ExoPlayer.Builder(context).build().also {"
+          builder_replacement = """val loadControl = DefaultLoadControl.Builder()
+                      .setBufferDurationsMs(
+                          15_000, // minimum buffer
+                          60_000, // maximum buffer
+                          5_000,  // start playback after buffering
+                          10_000  // resume after rebuffering
+                      )
+                      .build()
+                  val p = ExoPlayer.Builder(context).setLoadControl(loadControl).build().also {"""
+          if builder_anchor not in content:
+              raise SystemExit("Could not find ExoPlayer builder for video buffering patch")
+          content = content.replace(builder_anchor, builder_replacement, 1)
+          if "setBufferDurationsMs(" not in content or "setLoadControl(loadControl)" not in content:
+              raise SystemExit("AirPlay video buffering patch verification failed")
+          player.write_text(content, encoding="utf-8")
 
           strings = Path("airplay-src/app/src/main/res/values/strings.xml")
           content = strings.read_text(encoding="utf-8")
